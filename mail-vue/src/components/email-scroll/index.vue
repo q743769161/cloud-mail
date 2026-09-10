@@ -90,7 +90,7 @@
                         </slot>
                       </span>
                     </span>
-                    <span class="email-content">{{ item.text || '\u200B' }}</span>
+                    <span class="email-content">{{ item.listText || item.text || '\u200B' }}</span>
                   </div>
                   <div class="user-info" v-if="showUserInfo">
                     <div class="user">
@@ -388,7 +388,7 @@ function onScroll(e) {
 }
 
 const { arrivedState } = useScroll(scrollbarRef, {
-  offset: { bottom: 1200 }
+  offset: { bottom: isMobile.value ? 2200 : 1500 }
 })
 
 
@@ -490,11 +490,15 @@ window.addEventListener('wheel', (event) => {
 })
 
 function openReply(email) {
-  uiStore.writerRef.openReply(email)
+  const fullEmail = emailStore.detailMap[email.emailId]
+  if (!fullEmail) return
+  uiStore.writerRef.openReply(fullEmail)
 }
 
 function openForward(email) {
-  uiStore.writerRef.openForward(email)
+  const fullEmail = emailStore.detailMap[email.emailId]
+  if (!fullEmail) return
+  uiStore.writerRef.openForward(fullEmail)
 }
 
 function visibleChange(e) {
