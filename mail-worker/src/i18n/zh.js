@@ -28,6 +28,8 @@ const zh = {
 	notExistEmailReply: '邮件不存在无法回复',
 	imageAttLimit: '图片不能超过10个',
 	attLimit: '附件不能超过10个',
+	resendRecipientLimit: 'Resend 分开发送最多支持100位收件人',
+	resendSeparateAttachments: 'Resend 分开发送不能携带附件',
 	pwdLengthLimit: '密码长度超出限制',
 	emailLengthLimit: '邮箱长度超出限制',
 	minEmailPrefix: '邮箱名至少{{msg}}位',

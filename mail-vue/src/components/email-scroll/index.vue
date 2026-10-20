@@ -316,6 +316,8 @@ const firstLoad = ref(true)
 let scrollTop = 0
 const latestEmail = ref(null)
 const scrollbarRef = ref(null)
+// iPad can report a Mac platform when requesting desktop websites.
+const isMacOS = /Mac/.test(navigator.platform) && navigator.maxTouchPoints <= 1
 let reqLock = false
 let isMobile = ref(innerWidth < 1367)
 let skeletonRows = 0
@@ -537,10 +539,16 @@ const handleContextmenu = (event, email) => {
 
 function updateHasScrollbar() {
   nextTick(() => {
+
+    if (isMacOS) {
+      timePaddingRight.value = '15px'
+      return
+    }
+
     const doc = document.querySelector('.virtual');
     if (doc) {
       if (doc.scrollHeight > doc.clientHeight) {
-        timePaddingRight.value = '5px';
+        timePaddingRight.value = '6px';
       } else {
         timePaddingRight.value = '15px'
       }

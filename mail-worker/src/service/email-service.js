@@ -246,9 +246,8 @@ const emailService = {
 		return orm(c).insert(email).values({ ...params }).returning().get();
 	},
 
-	//邮件发送
+	// 发送入口：公共校验、参数准备、渠道选择和结果汇总。
 	async send(c, params, userId) {
-
 		let {
 			accountId, //发送账号id
 			name, //发件人名字
@@ -355,108 +354,187 @@ const emailService = {
 
 		}
 
-		let sendResult = {};
+		const sendParams = {
+			name,
+			accountEmail: accountRow.email,
+			receiveEmail,
+			subject,
+			text,
+			html,
+			attachments: [...imageDataList, ...attachments],
+			sendType,
+			messageId: emailRow.messageId
+		};
 
-		//存在站外邮箱时，如果配置了 Cloudflare Email Service 就优先使用，否则使用 Resend
-		if (!allInternal) {
+		if (imageDataList.length > 10) {
+			throw new BizError(t('imageAttLimit'));
+		}
+		if (attachments.length > 10) {
+			throw new BizError(t('attLimit'));
+		}
 
-			if (useCloudflareEmail) {
-				sendResult = await this.sendByCloudflareEmail(c, {
-					name,
-					accountEmail: accountRow.email,
-					receiveEmail,
-					subject,
-					text,
-					html,
-					attachments: [...imageDataList, ...attachments],
-					sendType,
-					messageId: emailRow.messageId
-				});
-			} else {
-				sendResult = await this.sendByResend(resendToken, {
-					name,
-					accountEmail: accountRow.email,
-					receiveEmail,
-					subject,
-					text,
-					html,
-					attachments: [...imageDataList, ...attachments],
-					sendType,
-					messageId: emailRow.messageId
-				});
+		const separate = params.manyType === 'divide';
+		// sendParams 用于渠道请求，saveParams 保留保存记录所需的账号、权限和附件数据。
+		const context = {
+			separate, allInternal, useCloudflareEmail, resendToken, sendParams,
+			saveParams: {
+				accountId, userId, name, subject, text, html,
+				sendEmail: accountRow.email,
+				messageId: emailRow.messageId,
+				sendType, useCloudflareEmail, roleRow, r2Domain,
+				imageDataList, attachments
+			}
+		};
+
+		// 全部站内收件人走本地投递；存在站外收件人时优先 CF，其次 Resend。
+		let deliveries;
+		if (allInternal) {
+			deliveries = this.sendInternal(c, context);
+		} else if (useCloudflareEmail) {
+			deliveries = this.sendCloudflare(c, context);
+		} else {
+			deliveries = this.sendResend(c, context);
+		}
+
+		const emailResults = [];
+		let sendError = '';
+
+		// 渠道每完成一组发送并保存记录后返回结果，后续发送失败仍保留已完成部分。
+		for await (const delivery of deliveries) {
+			if (delivery.error) {
+				sendError = delivery.error.message;
+				break;
 			}
 
+			emailResults.push(...delivery.emails);
 		}
 
-		const { data, error } = sendResult;
-
-
-		if (error) {
-			throw new BizError(error.message);
+		if (!separate) {
+			if (sendError) throw new BizError(sendError);
+			return emailResults;
 		}
 
-		imageDataList = imageDataList.map(item => ({...item, contentId: `<${item.contentId}>`}))
+		// 分开发送只返回尚未完成的收件人，供前端保留并重试。
+		const sentRecipients = emailResults.flatMap(item =>
+			JSON.parse(item.recipient).map(recipient => recipient.address)
+		);
+		return {
+			emails: emailResults,
+			failedRecipients: sendParams.receiveEmail.filter(address => !sentRecipients.includes(address)),
+			error: sendError
+		};
+	},
 
-		//把图片标签cid标签切换会通用url
-		html = this.imgReplace(html, imageDataList, r2Domain);
+	// 站内发送：普通发送共用一条发件记录，分开发送则每人一条，再写入站内收件箱。
+	async *sendInternal(c, { separate, sendParams, saveParams }) {
+		const recipientGroups = separate
+			? sendParams.receiveEmail.map(address => [address])
+			: [sendParams.receiveEmail];
+		for (const receiveEmail of recipientGroups) {
+			const emailResult = await this.saveSentEmail(c, { ...saveParams, receiveEmail });
+			await this.HandleOnSiteEmail(c, receiveEmail, emailResult, emailResult.attList);
+			yield { emails: [emailResult] };
+		}
+	},
 
-		//封装数据保存到数据库
-		const emailData = {};
-		emailData.sendEmail = accountRow.email;
-		emailData.name = name;
-		emailData.subject = subject;
-		emailData.content = html;
-		emailData.text = text;
-		emailData.accountId = accountId;
-		emailData.status = useCloudflareEmail ? emailConst.status.DELIVERED : emailConst.status.SENT;
-		emailData.type = emailConst.type.SEND;
-		emailData.userId = userId;
-		emailData.resendEmailId = data?.id;
+	// CF 发送：普通发送一次提交所有收件人，分开发送逐人调用并保存结果。
+	async *sendCloudflare(c, { separate, sendParams, saveParams }) {
+		const recipientGroups = separate
+			? sendParams.receiveEmail.map(address => [address])
+			: [sendParams.receiveEmail];
+		for (const receiveEmail of recipientGroups) {
+			let result;
+			try {
+				result = await this.sendByCloudflareEmail(c, { ...sendParams, receiveEmail });
+			} catch (error) {
+				if (!separate) throw error;
+				// 分开发送遇到渠道错误即停止，已成功的记录由入口汇总。
+				yield { error: { message: error.message } };
+				return;
+			}
+			const emailResult = await this.saveSentEmail(c, {
+				...saveParams, receiveEmail, providerId: result.data.id
+			});
+			yield { emails: [emailResult] };
+		}
+	},
 
-		const recipient = [];
+	// Resend 分开发送一次最多提交 100 封独立邮件，普通发送仍调用单封接口。
+	async *sendResend(c, { separate, resendToken, sendParams, saveParams }) {
+		if (separate && sendParams.receiveEmail.length > 100) {
+			throw new BizError(t('resendRecipientLimit'));
+		}
+		// 批量接口不支持附件，包含正文转换得到的内嵌附件。
+		if (separate && sendParams.attachments.length > 0) {
+			throw new BizError(t('resendSeparateAttachments'));
+		}
+		let result;
+		try {
+			result = separate
+				? await this.sendBatchByResend(resendToken, sendParams)
+				: await this.sendByResend(resendToken, sendParams);
+		} catch (error) {
+			if (!separate) throw error;
+			yield { error: { message: error.message } };
+			return;
+		}
+		if (result.error) {
+			yield { error: result.error };
+			return;
+		}
+		// 严格校验模式下，批量返回的邮件 ID 按提交顺序对应各收件人。
+		const items = separate
+			? sendParams.receiveEmail.map((address, index) => ({
+				receiveEmail: [address], id: result.data.data[index].id
+			}))
+			: [{ receiveEmail: sendParams.receiveEmail, id: result.data?.id }];
+		const emails = [];
+		for (const item of items) {
+			emails.push(await this.saveSentEmail(c, {
+				...saveParams, receiveEmail: item.receiveEmail, providerId: item.id
+			}));
+		}
+		yield { emails };
+	},
 
-		receiveEmail.forEach(item => {
-			recipient.push({ address: item, name: '' });
-		});
-
-		emailData.recipient = JSON.stringify(recipient);
-
+	// 三个渠道共用的发件记录保存：恢复正文图片 URL、保存附件并更新发送计数。
+	async saveSentEmail(c, params) {
+		const {
+			accountId, userId, name, subject, text, html, sendEmail, receiveEmail,
+			providerId, messageId, sendType, useCloudflareEmail,
+			roleRow, r2Domain, attachments
+		} = params;
+		const imageDataList = params.imageDataList.map(item => ({
+			...item, contentId: `<${item.contentId.replace(/^<|>$/g, '')}>`
+		}));
+		const emailData = {
+			sendEmail, name, subject, text, accountId, userId,
+			content: this.imgReplace(html, imageDataList, r2Domain),
+			status: useCloudflareEmail ? emailConst.status.DELIVERED : emailConst.status.SENT,
+			type: emailConst.type.SEND,
+			resendEmailId: providerId,
+			recipient: JSON.stringify(receiveEmail.map(address => ({ address, name: '' })))
+		};
 		if (sendType === 'reply') {
-			emailData.inReplyTo = emailRow.messageId;
-			emailData.relation = emailRow.messageId;
+			emailData.inReplyTo = messageId;
+			emailData.relation = messageId;
 		}
-
-		//如果权限有发送次数增加用户发送次数
 		if (roleRow.sendCount && roleRow.sendType !== 'internal') {
 			await userService.incrUserSendCount(c, receiveEmail.length, userId);
 		}
 
-		//保存到数据库并返回结果
 		const emailResult = await orm(c).insert(email).values(emailData).returning().get();
 
-		//保存内嵌附件
 		if (imageDataList.length > 0) {
-			if (imageDataList.length > 10) {
-				throw new BizError(t('imageAttLimit'));
-			}
 			await attService.saveArticleAtt(c, imageDataList, userId, accountId, emailResult.emailId);
 		}
 
-		//保存普通附件
 		if (attachments?.length > 0) {
-			if (attachments.length > 10) {
-				throw new BizError(t('attLimit'));
-			}
 			await attService.saveSendAtt(c, attachments, userId, accountId, emailResult.emailId);
 		}
 
 		const attList = await attService.selectByEmailIds(c, [emailResult.emailId]);
 		emailResult.attList = attList;
-
-		//如果全是站内接收方，直接写入数据库
-		if (allInternal) {
-			await this.HandleOnSiteEmail(c, receiveEmail, emailResult, attList);
-		}
 
 		const dateStr = dayjs().format('YYYY-MM-DD');
 		let daySendTotal = await c.env.kv.get(kvConst.SEND_DAY_COUNT + dateStr);
@@ -469,7 +547,27 @@ const emailService = {
 			await c.env.kv.put(kvConst.SEND_DAY_COUNT + dateStr, JSON.stringify(daySendTotal), { expirationTtl: 60 * 60 * 24 });
 		}
 
-		return [ emailResult ];
+		return emailResult;
+	},
+
+	// 附件已在 Resend 处理器中校验，批量接口为每位收件人构造独立邮件。
+	async sendBatchByResend(resendToken, params) {
+		const resend = new Resend(resendToken);
+		const sendForm = {
+			from: `${params.name} <${params.accountEmail}>`,
+			subject: params.subject,
+			text: params.text,
+			html: params.html
+		};
+		if (params.sendType === 'reply' && params.messageId) {
+			sendForm.headers = {
+				'in-reply-to': params.messageId,
+				'references': params.messageId
+			};
+		}
+		return resend.batch.send(params.receiveEmail.map(address => ({
+			...sendForm, to: [address]
+		})), { batchValidation: 'strict' });
 	},
 
 	async sendByCloudflareEmail(c, params) {
